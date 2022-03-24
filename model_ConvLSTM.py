@@ -40,7 +40,6 @@ class ConvLSTMCell(nn.Module):
                               padding = self.padding,
                               bias = self.bias)
 
-   
 
     def forward(self, input_tensor, cur_state):
         h_cur, c_cur = cur_state
@@ -48,11 +47,12 @@ class ConvLSTMCell(nn.Module):
         if torch.cuda.is_available():
             h_cur, c_cur, input_tensor = h_cur.to(device), c_cur.to(device), input_tensor.to(device)
 
-
         combined = torch.cat([input_tensor, h_cur], dim=1)  # concatenate along channel axis
 
         combined_conv = self.conv(combined)
+
         cc_i, cc_f, cc_o, cc_g = torch.split(combined_conv, self.hidden_dim, dim=1)
+        
         i = torch.sigmoid(cc_i)
         f = torch.sigmoid(cc_f)
         o = torch.sigmoid(cc_o)
@@ -193,8 +193,8 @@ class ConvLSTM(nn.Module):
             layer_output_list = layer_output_list[-1:]
             last_state_list = last_state_list[-1:]
 
+        return layer_output_list[0].squeeze(2), last_state_list  # layer_output_list[0] : B x S x 1 x H x W
 
-        return layer_output_list[0].squeeze(2), last_state_list  # layer_output_list[0] shape : B x S x 1 x H x W
 
     def _init_hidden(self, batch_size, image_size):
         init_states = []
@@ -202,11 +202,13 @@ class ConvLSTM(nn.Module):
             init_states.append(self.cell_list[i].init_hidden(batch_size, image_size))
         return init_states
 
+
     @staticmethod
     def _check_kernel_size_consistency(kernel_size):
         if not (isinstance(kernel_size, tuple) or
                 (isinstance(kernel_size, list) and all([isinstance(elem, tuple) for elem in kernel_size]))):
             raise ValueError('`kernel_size` must be tuple or list of tuples')
+
 
     @staticmethod
     def _extend_for_multilayer(param, num_layers):
