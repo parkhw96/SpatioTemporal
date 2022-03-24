@@ -1,11 +1,18 @@
 from cmath import inf
+from numpy import Inf
 import pandas as pd
 
 # Data Setup
 SEQ_SAMPLING = 200
 SAMPLE_UNIT = 4
-OVERLAP_GAP = 1
-MISSING_VALUE = inf
+OVERLAP_GAP = 20
+MISSING_VALUE = Inf
+
+WIDTH = 320
+HEIGHT = 240
+
+RADIUS = 7
+IOU_THRESHOLD = 0.1
 
 # Neural Network Training
 BATCH_SIZE = 4
