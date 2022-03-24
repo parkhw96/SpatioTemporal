@@ -44,68 +44,86 @@ class FootballDataset(torch.utils.data.Dataset):
             print("Load training data...")
             print(self.training_data_file_name)
             with open(self.training_data_file_name, 'rb') as f:
-                self.x_data, self.x_img_data, self.y_data, self.masking, self.time_lag = pickle.load(f)
+                self.x_data, self.gt_data, self.x_img_data, self.gt_img_data, self.coor_masking, self.img_masking, self.time_lag = pickle.load(f)
         else:
             print("Create training data...")
             self.create_training_data()
     
     def create_training_data(self):
         batch_list_x = []
-        batch_list_x_img = []
         batch_list_gt = []
-        batch_list_x_mask = []
-
+        batch_list_x_img = []
+        batch_list_gt_img = []
+        batch_list_coor_mask = []
+        batch_list_img_mask = []
+        
         for frame_idx in tqdm(self.available_idx_list):
-            seq_list_x, seq_list_x_img, seq_list_gt, seq_list_mask = [], [], [], []
+            seq_list_x, seq_list_gt, seq_list_x_img, seq_list_gt_img, seq_list_coor_mask, seq_list_img_mask = [], [], [], [], [], []
+
+            missing_frame_list = random.sample(range(int((SEQ_SAMPLING - SAMPLE_UNIT) / SAMPLE_UNIT)), int(((SEQ_SAMPLING-SAMPLE_UNIT) / SAMPLE_UNIT) * (self.missing_ratio / 100)))
+            missing_frame_idx = 0
 
             for _ in range(0, SEQ_SAMPLING-SAMPLE_UNIT, SAMPLE_UNIT):  # make sequence data
+            
+                current_frames = self.data[frame_idx * 22 : frame_idx * 22 + 22]
+                current_frames_cp = current_frames.copy()
+                gt_frames = self.data[(frame_idx + SAMPLE_UNIT) * 22 : (frame_idx + SAMPLE_UNIT) * 22 + 22]
 
-                current_frames = self.data[frame_idx * 22:frame_idx * 22 + 22]
-                gt_frames = self.data[(frame_idx + SAMPLE_UNIT) * 22: (frame_idx + SAMPLE_UNIT * 22) + 22]
+                if(missing_frame_idx in missing_frame_list):
+                    current_frames_cp[:, 2:4] = MISSING_VALUE
 
-                missing_num = random.randint(0, self.max_missing_num_per_frame) if self.missing else 0
-                missing_player_list = random.sample(range(22), missing_num)
+                x_list = current_frames_cp[:, 2:4].astype(float).reshape(-10)  # 44
+                y_list = gt_frames[:, 2:4].astype(float).reshape(-10)  # 44
+                coor_mask_list = np.ones(44) - np.ma.masked_where(x_list == MISSING_VALUE, x_list).mask
 
-                current_frames[missing_player_list, 2:4] = MISSING_VALUE  # missing x,y coordinate
+                img_mask_list = np.ones((HEIGHT + (RADIUS * 2), WIDTH + (RADIUS * 2)))
+                if(coor_mask_list[0] == 0):
+                    img_mask_list = np.zeros((HEIGHT + (RADIUS * 2), WIDTH + (RADIUS * 2)))
 
-                x_list = current_frames[:,2:4].astype(float).reshape(-10)  # 44
-                x_mask_list = np.ones(44) - np.ma.masked_where(x_list == MISSING_VALUE, x_list)
+                seq_list_x.append(torch.tensor(x_list))  # LSTM for coordinate
+                seq_list_gt.append(torch.tensor(y_list))  # LSTM for gt coordinate
+                seq_list_x_img.append(torch.tensor(make_coor_to_heatmap(current_frames_cp)))  # ConvLSTM for image
+                seq_list_gt_img.append(torch.tensor(make_coor_to_heatmap(gt_frames)))  # ConvLSTM for gt image
+                seq_list_coor_mask.append(torch.tensor(coor_mask_list))  # mask for coordinate
+                seq_list_img_mask.append(torch.tensor(img_mask_list))  # mask for image
 
-                seq_list_x.append(torch.tensor(x_list))
-                seq_list_gt.append(make_player_images(gt_frames))
-                seq_list_mask.append(torch.tensor(x_mask_list))
-                seq_list_x_img.append(make_player_images(current_frames))
-                
                 frame_idx = frame_idx + SAMPLE_UNIT
+                missing_frame_idx += 1
 
-            batch_list_x.append(torch.stack(seq_list_x).float())
-            batch_list_x_img.append(torch.stack(seq_list_x_img).float())
-            batch_list_gt.append(torch.stack(seq_list_gt).float())
-            batch_list_x_mask.append(torch.stack(seq_list_mask).int())
+            batch_list_x.append(torch.stack(seq_list_x).float())  # LSTM for coordinate
+            batch_list_gt.append(torch.stack(seq_list_gt).float())  # LSTM for gt coordinate
+            batch_list_x_img.append(torch.stack(seq_list_x_img).float())  # LSTM for image
+            batch_list_gt_img.append(torch.stack(seq_list_gt_img).float())  # LSTM for gt image
+            batch_list_coor_mask.append(torch.stack(seq_list_coor_mask).int())  # mask for coordinate
+            batch_list_img_mask.append(torch.stack(seq_list_img_mask).int())  # mask for image
         
-        self.x_data = torch.stack(batch_list_x)  # batch_size x seq_len x 44
+        self.x_data = torch.stack(batch_list_x)  # batch_size x seq_len x 44 (LSTM for coordinate)
 
-        self.x_img_data = torch.stack(batch_list_x_img)  #  batch_size x h x w
-        self.x_img_data  = self.x_img_data / 255 # scaling
+        self.gt_data = torch.stack(batch_list_gt)  # batch_size x seq_len x 44 (LSTM for gt coordinate)
 
-        self.y_data = torch.stack(batch_list_gt)  #  batch_size x h x w
-        self.y_data = self.y_data / 255 # scaling
+        self.x_img_data = torch.stack(batch_list_x_img)  #  batch_size x h x w (ConvLSTM for images)
 
-        self.masking = torch.stack(batch_list_x_mask)  # batch_size x seq_len x 44
+        self.gt_img_data = torch.stack(batch_list_gt_img)  #  batch_size x h x w (ConvLSTM for gt images)
 
-        self.time_lag = time_interval(self.masking) # batch_size x seq_len x 44
+        self.coor_masking = torch.stack(batch_list_coor_mask)  # batch_size x seq_len x 44 (mask for coordinate)
+
+        self.img_masking = torch.stack(batch_list_img_mask)  # batch_size x seq_len x h x w  (mask for image)
+
+        self.time_lag = time_interval(self.coor_masking) # batch_size x seq_len x 44
 
         with open(self.training_data_file_name, 'wb') as f:
-            pickle.dump([self.x_data, self.x_img_data, self.y_data, self.masking, self.time_lag], f)
+            pickle.dump([self.x_data, self.gt_data, self.x_img_data, self.gt_img_data, self.coor_masking, self.img_masking, self.time_lag], f)
 
     def __len__(self):
         return len(self.available_idx_list)
 
     def __getitem__(self, idx):
         x_data = self.x_data[idx]  # seq_len x 44
-        x_img_data = self.x_img_data[idx]  #  seq_len x w x h
-        y_data = self.y_data[idx]  #  seq_len x 22
-        x_mask = self.masking[idx]  #  seq_len x 44
-        time_lag = self.time_lag[idx] # seq_len
+        gt_data = self.gt_data[idx]  # seq_len x 44
+        x_img_data = self.x_img_data[idx]  # seq_len x h x w
+        gt_img_data = self.gt_img_data[idx]  # seq_len x 22
+        coor_mask = self.coor_masking[idx]  # seq_len x 44
+        img_mask = self.img_masking[idx]  # seq_len x h x w
+        time_lag = self.time_lag[idx]  # seq_len x 44
 
-        return x_data, x_img_data, y_data, x_mask, time_lag
+        return x_data, gt_data, x_img_data, gt_img_data, coor_mask, img_mask, time_lag
