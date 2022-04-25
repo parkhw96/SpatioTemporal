@@ -1,12 +1,129 @@
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from config import *
 from util import *
+from torch.autograd import Variable
+from torchsummary import summary
 
 gpu = 0
 device = torch.device(f'cuda:{str(gpu)}' if torch.cuda.is_available() else 'cpu')
+
+class LSTM_Model(nn.Module):
+    def __init__(self, feature_dim, rnn_dim, hidden_dim, input_dim, kernel_size, bias):
+        super(LSTM_Model, self).__init__()
+
+        self.feature_dim = feature_dim
+        self.rnn_dim = rnn_dim
+
+        self.rnn = nn.LSTMCell(feature_dim * 2, rnn_dim)  # batch_first guarantees the order of output = (B,S,F)
+
+        self.linear_layer_input = nn.Sequential(
+            nn.Linear(feature_dim, rnn_dim * 2),
+            nn.ReLU(),
+            nn.Linear(rnn_dim * 2, feature_dim),
+        )
+
+        self.linear_layer_out = nn.Linear(rnn_dim, feature_dim) 
+
+
+        self.hidden_dim = hidden_dim
+        self.input_dim = input_dim
+        self.kernel_size = 5
+        self.padding = kernel_size[0] // 2, kernel_size[1] // 2
+        self.bias = bias
+        self.output_dim = 4 * self.hidden_dim
+
+        # self.conv = nn.Conv2d(in_channels = self.input_dim + self.hidden_dim,
+        #                     out_channels = 4 * self.hidden_dim,
+        #                     kernel_size = self.kernel_size,
+        #                     padding = self.padding,
+        #                     bias = self.bias)
+
+        self.conv1 = nn.Conv2d(in_channels = 1, out_channels = 4, kernel_size = self.kernel_size)
+        self.conv2 = nn.Conv2d(in_channels = 4, out_channels = 8, kernel_size = self.kernel_size)
+
+        self.max_pool1 = nn.MaxPool2d(2)
+        self.max_pool2 = nn.MaxPool2d(2)
+        
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 32, 5, padding=1),  ## 28*28*1 -> 24*24*32
+            nn.ReLU(),
+            nn.Conv2d(32, 32, 5, padding=1),  ## 28*28*1 -> 24*24*32
+            nn.ReLU(),
+            nn.MaxPool2d(2, stride=2),  # 24*24*32 -> 12*12*32
+            nn.Dropout(0.1),
+            nn.Conv2d(32, 32, 5, padding=1),  # 12*12*3 -> 8*8*64
+            nn.ReLU(),
+            nn.Conv2d(32, 32, 5, padding=1),  # 12*12*3 -> 8*8*64
+            nn.ReLU(),
+            nn.MaxPool2d(2, stride=2),  # 8*8*64-> 4*4*32
+            nn.Dropout(0.1),
+            nn.Conv2d(32, 32, 5, padding=1),  # 12*12*3 -> 8*8*64
+            nn.ReLU(),
+            nn.Conv2d(32, 32, 5, padding=1),  # 12*12*3 -> 8*8*64
+            nn.ReLU(),
+            nn.MaxPool2d(2, stride=2),  # 8*8*64-> 4*4*32
+            nn.Dropout(0.1),
+        )
+
+        self.fc = nn.Sequential(nn.Linear(1920, 32), nn.ReLU(), nn.Linear(32, 44))
+
+        # self.linear_layer_conv_out = nn.Linear(self.output_dim, feature_dim)   
+        # self.linear_layer_conv_out = nn.Linear(4032, 44)
+
+
+    def forward(self, x, masking, img_x, embed_mode=False):
+        # x = B x S x 44 (coordinate for LSTM)
+        # masking = B x S x 44 (mask for LSTM)
+
+        bs = x.shape[0]
+        seq_len = x.shape[1]
+        height = img_x.shape[-2]
+        width = img_x.shape[-1]
+
+        if embed_mode:
+            # img_x : B X S X H X W
+            img_x = img_x.unsqueeze(2).reshape(bs * seq_len, 1, height, width)  # (B X S) X 1 x H x W
+
+            embeded_x = self.conv(img_x)  # (B X S) X 32 x H x W
+            embeded_x = embeded_x.reshape(bs * seq_len, -1)  # (B X S) X (32 x H x W)
+            # embeded_x = self.conv1(img_x)
+            # embeded_x1 = self.max_pool1(embeded_x)
+            # embeded_x2 = self.conv2(embeded_x1)
+            # embeded_x3 = self.max_pool2(embeded_x2)
+            # embeded_x4 = embeded_x3.reshape(bs * seq_len, -1)
+
+            x = self.fc(embeded_x)
+            # x = self.linear_layer_conv_out(embeded_x)
+            x = x.reshape(bs, seq_len, 44)
+
+        h = Variable(torch.zeros((bs, self.rnn_dim))).to(device)
+        c = Variable(torch.zeros((bs, self.rnn_dim))).to(device)
+
+        x = x.permute(1, 0, 2)  # S x B x 44
+        masking = masking.permute(1, 0, 2) # S x B x 44
+
+        output_list = []
+        for i in range(seq_len):
+            output = self.linear_layer_out(h)
+
+            masked_x = (masking[i] * x[i] + (1 - masking[i] * output.squeeze(0)))
+
+            rnn_x = self.linear_layer_input(masked_x)
+
+            input_data = torch.cat([rnn_x, masking[i]], dim = 1)
+
+            h, c = self.rnn(input_data, (h, c))
+
+            output_list.append(output.squeeze(0))
+        
+        return torch.stack(output_list).float().squeeze()    
+
+
 
 class ConvLSTMCell(nn.Module):
 
