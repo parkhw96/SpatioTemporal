@@ -9,9 +9,14 @@ import scipy.ndimage as ndimage
 import scipy.ndimage.filters as filters
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
+import math
+
 
 gpu = 0
 device = torch.device(f'cuda:{str(gpu)}' if torch.cuda.is_available() else 'cpu')
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 def find_frame_drop_idx(episode_list_idx):
     frame_drop_idx_np = np.array(episode_list_idx)
@@ -35,30 +40,7 @@ def array_of_available_indices(episode_list, use_idx, overlap=False):
 
     return np.array(available_idx_list)
  
-import numpy
- 
-def fig2data_gray(fig):
-    """
-    @brief Convert a Matplotlib figure to a 4D numpy array with RGBA channels and return it
-    @param fig a matplotlib figure
-    @return a numpy 3D array of RGBA values
-    """
-    # draw the renderer
-    fig.canvas.draw()
-     
-    # Get the RGBA buffer from the figure
-    w,h = fig.canvas.get_width_height()
-    
-    buf = numpy.frombuffer(fig.canvas.tostring_rgb(), dtype=numpy.uint8)
-    
-    buf.shape = (h, w, 3)
-     
-    R, G, B = buf[:, :, 0], buf[:, :, 1], buf[:, :, 2] 
-    buf = R
-    
-    return buf
-
-def xy_conversion_center_to_lowerleft(center_x, center_y):
+def xy_conversion_center_to_upperleft(center_x, center_y):
 
     upper_left_x = (WIDTH / 2) + center_x
     upper_left_y = (HEIGHT / 2) - center_y
@@ -81,7 +63,7 @@ def make_coor_to_heatmap(current_frames):
     y_grid = np.arange(y_min - RADIUS, y_max + RADIUS, 1)
     x_mesh, y_mesh = np.meshgrid(x_grid, y_grid)
 
-    new_x, new_y = xy_conversion_center_to_lowerleft(x_list, y_list)
+    new_x, new_y = xy_conversion_center_to_upperleft(x_list, y_list)
 
     new_x = new_x.astype(float)
     new_y = new_y.astype(float)
@@ -142,56 +124,164 @@ class Heatmap:
 
         return np.array(intensity_list)
 
-def make_heatmap_to_coor(current_img):
-    
+def make_heatmap_to_coor_ConvLSTM(gt_coor, pred_img):
     neighborhood_size = 5
-    threshold = 0.2
+    threshold = LOCAL_MAXIMA_THRESHOLD
 
-    data = current_img
-    data = data.detach().cpu().numpy()
+    total_recall_count = 0
+    total_precision_count = 0
 
-    batch_list_coor = []
-    for b in range(current_img.shape[0]):
-        seq_list_coor = []
-        for s in range(current_img.shape[1]):
-            data_max = filters.maximum_filter(data[b, s, :, :], neighborhood_size)
-            maxima = (data[b, s, :, :] == data_max)
+    total_gt = 0
+    total_pred = 0
 
-            data_min = filters.minimum_filter(data[b, s, :, :], neighborhood_size)
-            diff = ((data_max - data_min) > threshold)
-            maxima[diff == 0] = 0
-
-            labeled, num_objects = ndimage.label(maxima)
-            slices = ndimage.find_objects(labeled)
-            x, y = [], []
-
-            for dy,dx in slices:
-                x_center = (dx.start + dx.stop - 1) / 2
-                x.append(x_center)
-                y_center = (dy.start + dy.stop - 1) / 2    
-                y.append(y_center)
-
-            if(len(x)) != 22:
-                for _ in range(22 - len(x)):
-                    x.append(1000)
-                    y.append(1000)
-
-            seq_list_coor.append(torch.stack([torch.tensor(x), torch.tensor(y)], dim = -1).flatten())
-        
-        batch_list_coor.append(torch.stack(seq_list_coor).float())
+    data = pred_img.detach().cpu().numpy()
     
-    conversion_coor = xy_conversion_upperleft_to_center(torch.stack(batch_list_coor))
+    for b in range(pred_img.shape[0]):
+        for s in range(pred_img.shape[1]):
+            if(gt_coor[b, s, :].sum() != 0):
+                data_max = filters.maximum_filter(data[b, s, :, :], neighborhood_size)
+                maxima = (data[b, s, :, :] == data_max)
 
-    return conversion_coor
+                data_min = filters.minimum_filter(data[b, s, :, :], neighborhood_size)
+                diff = ((data_max - data_min) > threshold)
+                maxima[diff == 0] = 0
+
+                labeled, num_objects = ndimage.label(maxima)
+                slices = ndimage.find_objects(labeled)
+                x, y = [], []
+
+                for dy,dx in slices:
+                    x_center = (dx.start + dx.stop - 1) / 2
+                    x.append(x_center)
+                    y_center = (dy.start + dy.stop - 1) / 2    
+                    y.append(y_center)
+
+                pred_coor = torch.stack([torch.tensor(x), torch.tensor(y)], dim = -1).flatten().tolist()
+
+                total_gt += gt_coor.shape[2] // 2
+                total_pred += len(pred_coor) // 2
+
+                conversion_pred_coor = xy_conversion_upperleft_to_center(pred_coor)
+                l_c, p_c = recall_precision_calculation(gt_coor, conversion_pred_coor, b, s)
+                
+                total_recall_count += l_c
+                total_precision_count += p_c
+
+    return total_gt, total_recall_count, total_pred, total_precision_count
+
+def make_heatmap_to_coor_LSTM(gt_coor, pred_coor):
+    total_recall_count = 0
+    total_precision_count = 0
+
+    total_gt = 0
+    total_pred = 0
+    
+    for b in range(pred_coor.shape[0]):
+        for s in range(pred_coor.shape[1]):
+            if(gt_coor[b, s, :].sum() != 0):
+                total_gt += gt_coor.shape[2] // 2
+                total_pred += len(pred_coor[b, s, :]) // 2
+
+                l_c, p_c = recall_precision_calculation(gt_coor, pred_coor[b, s, :].tolist(), b, s)
+                
+                total_recall_count += l_c
+                total_precision_count += p_c
+
+    return total_gt, total_recall_count, total_pred, total_precision_count
+
+
+def recall_precision_calculation(gt_coor, pred_coor, batch, sequence):
+    # gt_coor = B x S x 44
+    # pred_coor = 2n (n >= 0)
+
+    recall_count = 0
+    precision_count = 0
+    
+    for i in range(gt_coor.shape[2] // 2):
+        len_pred_coor = len(pred_coor) // 2
+        for j in range(len_pred_coor):
+            a = math.sqrt((gt_coor[batch, sequence, 2 * i] - pred_coor[2 * j]) ** 2 + (gt_coor[batch, sequence, (2 * i) + 1] - pred_coor[(2 * j) + 1]) ** 2)
+            if math.sqrt((gt_coor[batch, sequence, 2 * i] - pred_coor[2 * j]) ** 2 + (gt_coor[batch, sequence, (2 * i) + 1] - pred_coor[(2 * j) + 1]) ** 2) <= DISTANCE_THRESHOLD:
+                del pred_coor[2 * j], pred_coor[2 * j]
+               
+                recall_count += 1
+                precision_count += 1
+                
+                break
+    
+    return recall_count, precision_count
+
+
+# upper left coordinates -> center coordinates
+# together with 'make_player_img_to_coor' function
+def xy_conversion_upperleft_to_center(upper_left_coor):
+    
+    center_coor = upper_left_coor.copy()
+    center_coor = torch.tensor(center_coor)
+
+    upper_left_coor = torch.tensor(upper_left_coor)
+
+    center_coor[0::2] = upper_left_coor[0::2] - ((WIDTH + RADIUS * 2) / 2)
+    center_coor[1::2] = -(upper_left_coor[1::2] - ((HEIGHT + RADIUS * 2) / 2))
+    
+    return center_coor.tolist()
+
+
+
+# def make_heatmap_to_coor(current_img):
+    
+#     neighborhood_size = 5
+#     threshold = 0.2
+
+#     data = current_img
+#     data = data.detach().cpu().numpy()
+
+#     batch_list_coor = []
+#     for b in range(current_img.shape[0]):
+#         seq_list_coor = []
+#         for s in range(current_img.shape[1]):
+#             data_max = filters.maximum_filter(data[b, s, :, :], neighborhood_size)
+#             maxima = (data[b, s, :, :] == data_max)
+
+#             data_min = filters.minimum_filter(data[b, s, :, :], neighborhood_size)
+#             diff = ((data_max - data_min) > threshold)
+#             maxima[diff == 0] = 0
+
+#             labeled, num_objects = ndimage.label(maxima)
+#             slices = ndimage.find_objects(labeled)
+#             x, y = [], []
+
+#             for dy,dx in slices:
+#                 x_center = (dx.start + dx.stop - 1) / 2
+#                 x.append(x_center)
+#                 y_center = (dy.start + dy.stop - 1) / 2    
+#                 y.append(y_center)
+
+#             if(len(x)) != 22:
+#                 for _ in range(22 - len(x)):
+#                     x.append(1000)
+#                     y.append(1000)
+
+#             seq_list_coor.append(torch.stack([torch.tensor(x), torch.tensor(y)], dim = -1).flatten())
+        
+#         batch_list_coor.append(torch.stack(seq_list_coor).float())
+    
+#     conversion_coor = xy_conversion_upperleft_to_center(torch.stack(batch_list_coor))
+
+#     return conversion_coor
+
+
+
+
 
 # center coordinates -> upper left coordinates
 # together with 'make_player_coor_to_img' function
-def xy_conversion_center_to_upperleft(center_x, center_y):
+# def xy_conversion_center_to_upperleft(center_x, center_y):
 
-    upper_left_x = center_x + (WIDTH / 2)
-    upper_left_y = center_y + (HEIGHT / 2)
+#     upper_left_x = center_x + (WIDTH / 2)
+#     upper_left_y = center_y + (HEIGHT / 2)
     
-    return upper_left_y, upper_left_x
+#     return upper_left_y, upper_left_x
 
 
 # def make_player_coor_to_img(current_frames):
@@ -216,16 +306,7 @@ def xy_conversion_center_to_upperleft(center_x, center_y):
 #     return img  # h x w
 
 
-# upper left coordinates -> center coordinates
-# together with 'make_player_img_to_coor' function
-def xy_conversion_upperleft_to_center(upper_left_coor):
-    
-    center_coor = upper_left_coor.clone().detach()
 
-    center_coor[:, :, 0::2] = upper_left_coor[:, :, 0::2] - ((WIDTH + RADIUS * 2) / 2)
-    center_coor[:, :, 1::2] = -(upper_left_coor[:, :, 1::2] - ((HEIGHT + RADIUS * 2) / 2))
-    
-    return center_coor
 
 
 #  image -> center coordinate
@@ -273,97 +354,97 @@ def make_player_img_to_coor(img):
 
 #     return torch.tensor(gray_array)
 
-def make_player_images_to_coor(input_tensor):
-    batch_list = []
-    input_tensor = input_tensor.to(device)
+# def make_player_images_to_coor(input_tensor):
+#     batch_list = []
+#     input_tensor = input_tensor.to(device)
 
-    fig, ax = plt.subplots(figsize=(3.2, 2.4))  # control figure size(default : (6.4, 4.8))
+#     fig, ax = plt.subplots(figsize=(3.2, 2.4))  # control figure size(default : (6.4, 4.8))
 
-    fig.patch.set_facecolor('black')
+#     fig.patch.set_facecolor('black')
 
-    ax.set_facecolor("black")
+#     ax.set_facecolor("black")
 
-    ax.set_xlim(-120, 120) # x축 범위
-    ax.set_ylim(-120, 120) # y축 범위
+#     ax.set_xlim(-120, 120) # x축 범위
+#     ax.set_ylim(-120, 120) # y축 범위
     
-    ax.axes.xaxis.set_visible(False) # x축 레이블 안보이게 설정
-    ax.axes.yaxis.set_visible(False) # y축 레이블 안보이게 설정
+#     ax.axes.xaxis.set_visible(False) # x축 레이블 안보이게 설정
+#     ax.axes.yaxis.set_visible(False) # y축 레이블 안보이게 설정
 
-    ax.spines['left'].set_position('center') # 왼쪽 축을 가운데 위치로 이동
-    ax.spines['left'].set_visible(False)
+#     ax.spines['left'].set_position('center') # 왼쪽 축을 가운데 위치로 이동
+#     ax.spines['left'].set_visible(False)
 
-    ax.spines['bottom'].set_position('center') # 아래 축을 가운데 위치로 이동
-    ax.spines['bottom'].set_visible(False)
+#     ax.spines['bottom'].set_position('center') # 아래 축을 가운데 위치로 이동
+#     ax.spines['bottom'].set_visible(False)
 
-    ax.spines['top'].set_visible(False) # 윗 축을 안보이게 설정
+#     ax.spines['top'].set_visible(False) # 윗 축을 안보이게 설정
 
-    ax.spines['right'].set_visible(False) # 오른쪽 축을 안보이게 설정
+#     ax.spines['right'].set_visible(False) # 오른쪽 축을 안보이게 설정
 
-    for b in range(input_tensor.size(0)):
-        seq_list = []
-        for s in range(input_tensor.size(1)):
-            for i in range(22):
-                plt.scatter(input_tensor[b,s,2 * i].cpu().detach().numpy(), input_tensor[b,s,(2 * i)+1].cpu().detach().numpy(), s=1, marker=',', c="white", linewidths=0, edgecolors='none')
-            gray_array = fig2data_gray(fig) # w x h
-            seq_list.append(torch.tensor(gray_array))
-            plt.close()
-        batch_list.append(torch.stack(seq_list).float())
+#     for b in range(input_tensor.size(0)):
+#         seq_list = []
+#         for s in range(input_tensor.size(1)):
+#             for i in range(22):
+#                 plt.scatter(input_tensor[b,s,2 * i].cpu().detach().numpy(), input_tensor[b,s,(2 * i)+1].cpu().detach().numpy(), s=1, marker=',', c="white", linewidths=0, edgecolors='none')
+#             gray_array = fig2data_gray(fig) # w x h
+#             seq_list.append(torch.tensor(gray_array))
+#             plt.close()
+#         batch_list.append(torch.stack(seq_list).float())
         
-    pred_img = torch.stack(batch_list)
+#     pred_img = torch.stack(batch_list)
 
-    return pred_img / 255
+#     return pred_img / 255
 
-def IoU(box1_list, box2_list, threshold=IOU_THRESHOLD):
-    # box1_list = gt(B x S x 44)
-    # box2_list = pred(B x S x 44)
+# def IoU(box1_list, box2_list, threshold=IOU_THRESHOLD):
+#     # box1_list = gt(B x S x 44)
+#     # box2_list = pred(B x S x 44)
 
-    box1_list = box1_list.to(device).detach().cpu().numpy()
-    box2_list = box2_list.to(device).detach().cpu().numpy()
+#     box1_list = box1_list.to(device).detach().cpu().numpy()
+#     box2_list = box2_list.to(device).detach().cpu().numpy()
 
-    box1_len, box2_len = 25, 25
-    box1_area, box2_area = (box1_len * 2) ** 2, (box2_len * 2) ** 2
+#     box1_len, box2_len = 25, 25
+#     box1_area, box2_area = (box1_len * 2) ** 2, (box2_len * 2) ** 2
 
-    # linear_sum_assignment안의 cdist에 2D array가 들어가야 하기 때문에 이중 for문 사용
-    # 예측된 이미지에서 선수들의 좌표를 골라내면 GT 좌표 순서와 다르기 때문에 linear_sum_assignment 사용
-    for b in range(box1_list.shape[0]):
-        for s in range(box1_list.shape[1]):
-            row_idx, col_idx = linear_sum_assignment(cdist(box1_list[b, s, :].reshape(22, 2), box2_list[b, s, :].reshape(22, 2)))
-            box2_list[b, s, :] = box2_list[b, s, :].reshape(22, 2)[col_idx].flatten()
+#     # linear_sum_assignment안의 cdist에 2D array가 들어가야 하기 때문에 이중 for문 사용
+#     # 예측된 이미지에서 선수들의 좌표를 골라내면 GT 좌표 순서와 다르기 때문에 linear_sum_assignment 사용
+#     for b in range(box1_list.shape[0]):
+#         for s in range(box1_list.shape[1]):
+#             row_idx, col_idx = linear_sum_assignment(cdist(box1_list[b, s, :].reshape(22, 2), box2_list[b, s, :].reshape(22, 2)))
+#             box2_list[b, s, :] = box2_list[b, s, :].reshape(22, 2)[col_idx].flatten()
     
-    box1_list = torch.tensor(box1_list).to(device)
-    box2_list = torch.tensor(box2_list).to(device)
+#     box1_list = torch.tensor(box1_list).to(device)
+#     box2_list = torch.tensor(box2_list).to(device)
     
-    iou_batch_list = []
-    for b in range(box1_list.shape[0]):
-        iou_seq_list = []
-        for s in range(box1_list.shape[1]):
-            iou_player_list = []
-            for i in range(22):
-                x1 = torch.max(box1_list[b, s, 2 * i] - box1_len, box2_list[b, s, 2 * i] - box2_len)
-                y1 = torch.max(box1_list[b, s, (2 * i) + 1] - box1_len, box2_list[b, s, (2 * i) + 1] - box2_len)
-                x2 = torch.min(box1_list[b, s, 2 * i] + box1_len, box2_list[b, s, 2 * i] + box2_len)
-                y2 = torch.min(box1_list[b, s, (2 * i) + 1] + box1_len, box2_list[b, s, (2 * i) + 1] + box2_len)
+#     iou_batch_list = []
+#     for b in range(box1_list.shape[0]):
+#         iou_seq_list = []
+#         for s in range(box1_list.shape[1]):
+#             iou_player_list = []
+#             for i in range(22):
+#                 x1 = torch.max(box1_list[b, s, 2 * i] - box1_len, box2_list[b, s, 2 * i] - box2_len)
+#                 y1 = torch.max(box1_list[b, s, (2 * i) + 1] - box1_len, box2_list[b, s, (2 * i) + 1] - box2_len)
+#                 x2 = torch.min(box1_list[b, s, 2 * i] + box1_len, box2_list[b, s, 2 * i] + box2_len)
+#                 y2 = torch.min(box1_list[b, s, (2 * i) + 1] + box1_len, box2_list[b, s, (2 * i) + 1] + box2_len)
 
-                # compute the width and height of the intersection
-                w = torch.max(torch.zeros(x1.shape).to(device), x2 - x1)
-                h = torch.max(torch.zeros(y1.shape).to(device), y2 - y1)
+#                 # compute the width and height of the intersection
+#                 w = torch.max(torch.zeros(x1.shape).to(device), x2 - x1)
+#                 h = torch.max(torch.zeros(y1.shape).to(device), y2 - y1)
 
-                inter = w * h
-                iou = inter / (box1_area + box2_area - inter)
+#                 inter = w * h
+#                 iou = inter / (box1_area + box2_area - inter)
 
-                iou_player_list.append(iou)
+#                 iou_player_list.append(iou)
         
-            iou_seq_list.append(torch.stack(iou_player_list).float())
+#             iou_seq_list.append(torch.stack(iou_player_list).float())
         
-        iou_batch_list.append(torch.stack(iou_seq_list).float())
+#         iou_batch_list.append(torch.stack(iou_seq_list).float())
 
-    iou_batch_list = torch.stack(iou_batch_list)
-    # result = iou_list.permute(1, 2, 0)  # B x S x 22
+#     iou_batch_list = torch.stack(iou_batch_list)
+#     # result = iou_list.permute(1, 2, 0)  # B x S x 22
     
-    result_count = (iou_batch_list >= threshold).sum() - (iou_batch_list  == 1).sum()
-    # result_count = (result >= threshold).sum()
+#     result_count = (iou_batch_list >= threshold).sum() - (iou_batch_list  == 1).sum()
+#     # result_count = (result >= threshold).sum()
 
-    return result_count
+#     return result_count
 
 def time_interval(x_mask):
     # x_mask = b x s x 44
